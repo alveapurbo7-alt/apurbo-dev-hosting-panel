@@ -12,9 +12,10 @@ import threading
 import time
 import zipfile
 import psutil
+from werkzeug.utils import secure_filename
 
-app = Flask(__name__)
-app.secret_key = 'jubayer-super-secret-key-2026'
+app = Flask(__name__, template_folder='.')
+app.secret_key = os.environ.get('SECRET_KEY', 'change-this-secret-key')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
 USERS_FILE = 'users.json'
@@ -109,6 +110,34 @@ def get_server_dir(server_id):
     os.makedirs(server_dir, exist_ok=True)
     return server_dir
 
+def safe_server_path(server_id, relative_path=''):
+    """Return a path inside a server directory; reject traversal/absolute paths."""
+    base = os.path.realpath(get_server_dir(server_id))
+    relative_path = str(relative_path or '').replace('\\', '/')
+    if relative_path.startswith('/') or '\x00' in relative_path:
+        raise ValueError('Invalid path')
+    candidate = os.path.realpath(os.path.join(base, relative_path))
+    if os.path.commonpath([base, candidate]) != base:
+        raise ValueError('Invalid path')
+    return candidate
+
+def get_session_server(server_id):
+    if session.get('role') != 'user' or session.get('current_server_id') != server_id:
+        return None, None
+    server, username = get_server_by_id(server_id)
+    if not server or username != session.get('user'):
+        return None, None
+    valid, result = check_server_valid(server_id)
+    if not valid:
+        return None, None
+    return result, username
+
+def require_server_access(server_id):
+    server, username = get_session_server(server_id)
+    if not server:
+        return None, jsonify({'status': 'error', 'msg': 'Unauthorized'}), 403
+    return server, None, None
+
 def check_server_valid(server_id):
     users = load_users()
     for uname, data in users.items():
@@ -120,10 +149,11 @@ def check_server_valid(server_id):
                 expiry = s.get('expiry', '')
                 if expiry:
                     try:
-                        exp_date = datetime.strptime(expiry, '%Y-%m-%d %H:%M:%S.%f')
+                        exp_date = datetime.fromisoformat(str(expiry))
                         if datetime.now() > exp_date:
                             return False, "expired"
-                    except: pass
+                    except (TypeError, ValueError):
+                        return False, "expired"
                 return True, s
     return False, "deleted"
 
@@ -168,7 +198,11 @@ while True:
 
 def run_bot(server_id, main_file='main.py', requirements_file='requirements.txt'):
     server_dir = get_server_dir(server_id)
-    main_path = os.path.join(server_dir, main_file)
+    try:
+        main_path = safe_server_path(server_id, main_file)
+        req_path_for_validation = safe_server_path(server_id, requirements_file) if requirements_file else None
+    except ValueError:
+        return None, 'Invalid startup file path!'
     log_file = os.path.join(server_dir, 'output.log')
     python_exe = sys.executable
     
@@ -195,7 +229,11 @@ def run_bot(server_id, main_file='main.py', requirements_file='requirements.txt'
     log("")
     
     if requirements_file and requirements_file.strip():
-        req_path = os.path.join(server_dir, requirements_file.strip())
+        try:
+            req_path = safe_server_path(server_id, requirements_file.strip())
+        except ValueError:
+            log(f"[{ts()}] Invalid requirements file path")
+            return None, 'Invalid requirements file path!'
         log(f"[{ts()}] Run: pip install -r {requirements_file}")
         log("")
         
@@ -582,8 +620,8 @@ def create_server():
     if 'user' not in session or session.get('role') != 'admin':
         return jsonify({'error': 'Unauthorized'}), 403
     
-    data = request.get_json()
-    username = data.get('username', '')
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username', '')).strip()
     password = data.get('password', '')
     server_type = data.get('server_type', 'python')
     ram = data.get('ram', '512MB')
@@ -592,7 +630,15 @@ def create_server():
     cpu_limit = int(data.get('cpu_limit', 80))
     
     if not username or not password:
-        return jsonify({'error': 'Required!'}), 400
+        return jsonify({'error': 'Username and password are required!'}), 400
+    if username == 'admin':
+        return jsonify({'error': 'The admin account cannot own hosting servers.'}), 400
+    if len(username) < 3 or len(password) < 4:
+        return jsonify({'error': 'Username must be at least 3 characters and password at least 4 characters.'}), 400
+    if expiry_days < 1 or expiry_days > 3650:
+        return jsonify({'error': 'Expiry must be between 1 and 3650 days.'}), 400
+    if cpu_limit < 10 or cpu_limit > 100:
+        return jsonify({'error': 'CPU limit must be between 10 and 100.'}), 400
     
     users = load_users()
     server_id = str(uuid.uuid4())[:8]
@@ -629,7 +675,12 @@ def create_server():
 def set_rate_limit(server_id):
     if 'user' not in session or session.get('role') != 'admin':
         return jsonify({'error': 'Unauthorized'}), 403
-    cpu_limit = int(request.get_json().get('cpu_limit', 80))
+    try:
+        cpu_limit = int((request.get_json(silent=True) or {}).get('cpu_limit', 80))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid CPU limit'}), 400
+    if not 10 <= cpu_limit <= 100:
+        return jsonify({'error': 'CPU limit must be between 10 and 100'}), 400
     users = load_users()
     for uname, udata in users.items():
         if uname == 'admin': continue
@@ -668,6 +719,9 @@ def delete_server(username, server_id):
 
 @app.route('/api/run/<server_id>', methods=['POST'])
 def api_run(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     server, _ = get_server_by_id(server_id)
     if not server: return jsonify({'status': 'error', 'msg': 'Not found'})
     if server.get('status') == 'running': return jsonify({'status': 'error', 'msg': 'Already running!'})
@@ -696,6 +750,9 @@ def api_run(server_id):
 
 @app.route('/api/stop/<server_id>', methods=['POST'])
 def api_stop(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     server, _ = get_server_by_id(server_id)
     if not server: return jsonify({'status': 'error', 'msg': 'Not found'})
     
@@ -724,6 +781,9 @@ def api_stop(server_id):
 
 @app.route('/api/logs/<server_id>')
 def api_logs(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     log_file = os.path.join(get_server_dir(server_id), 'output.log')
     if os.path.exists(log_file):
         with open(log_file, 'r', encoding='utf-8') as f: logs = f.read()
@@ -732,6 +792,9 @@ def api_logs(server_id):
 
 @app.route('/api/clear_logs/<server_id>', methods=['POST'])
 def api_clear_logs(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     log_file = os.path.join(get_server_dir(server_id), 'output.log')
     try:
         if os.path.exists(log_file):
@@ -742,9 +805,14 @@ def api_clear_logs(server_id):
 
 @app.route('/api/command', methods=['POST'])
 def api_command():
-    data = request.get_json()
-    cmd = data.get('cmd', '')
-    server_id = data.get('server_id', '')
+    data = request.get_json(silent=True) or {}
+    cmd = str(data.get('cmd', '')).strip()
+    server_id = str(data.get('server_id', '')).strip()
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
+    if not cmd:
+        return jsonify({'status': 'error', 'msg': 'Command is required'}), 400
     log_file = os.path.join(get_server_dir(server_id), 'output.log')
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=get_server_dir(server_id), timeout=30,
@@ -757,6 +825,9 @@ def api_command():
 
 @app.route('/api/stats/<server_id>')
 def api_stats(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     server, _ = get_server_by_id(server_id)
     if not server:
         return jsonify({'cpu': '0%', 'ram': '0 MB', 'uptime': '0h', 'status': 'unknown', 'cpu_limit': 80, 'net_in': '0 KB', 'net_out': '0 KB'})
@@ -787,6 +858,9 @@ def api_stats(server_id):
 
 @app.route('/api/change_password/<server_id>', methods=['POST'])
 def api_change_password(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     if 'user' not in session: return jsonify({'error': 'Please login first!'}), 403
     data = request.get_json()
     current_password = data.get('current_password', '')
@@ -812,163 +886,100 @@ def api_change_password(server_id):
 
 @app.route('/api/github/deploy/<server_id>', methods=['POST'])
 def api_github_deploy(server_id):
-    """Download GitHub repo without git - using Python requests"""
-    data = request.get_json()
-    repo_url = data.get('repo_url', '').strip()
-    access_token = data.get('access_token', '').strip()
-    is_private = data.get('is_private', False)
-    
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
+    data = request.get_json(silent=True) or {}
+    repo_url = str(data.get('repo_url', '')).strip()
+    access_token = str(data.get('access_token', '')).strip()
+    is_private = bool(data.get('is_private', False))
     if not repo_url:
         return jsonify({'status': 'error', 'msg': 'Repository URL is required!'}), 400
-    
+    if 'github.com/' not in repo_url.lower():
+        return jsonify({'status': 'error', 'msg': 'Only GitHub repository URLs are supported!'}), 400
+
     server_dir = get_server_dir(server_id)
     log_file = os.path.join(server_dir, 'github_deploy.log')
-    
-    # Clear old deploy log
-    try:
-        with open(log_file, 'w', encoding='utf-8') as f:
-            f.write(f"[{datetime.now().strftime('%I:%M:%S %p')}] Starting GitHub deployment...\n")
-            f.write(f"[{datetime.now().strftime('%I:%M:%S %p')}] Repository: {repo_url}\n")
-            f.write(f"[{datetime.now().strftime('%I:%M:%S %p')}] Type: {'Private' if is_private else 'Public'}\n")
-            f.write("─" * 40 + "\n")
-    except:
-        pass
-    
+    with open(log_file, 'w', encoding='utf-8') as f:
+        f.write(f"[{datetime.now().strftime('%I:%M:%S %p')}] Starting GitHub deployment...\n")
+
     def deploy_thread():
+        import requests
         try:
-            import requests
-            import shutil
-            
-            def deploy_log(msg):
+            from urllib.parse import urlparse
+            parsed = urlparse(repo_url.rstrip('/'))
+            parts = [p for p in parsed.path.strip('/').split('/') if p]
+            if len(parts) < 2 or parsed.netloc.lower() not in ('github.com', 'www.github.com'):
+                raise ValueError('Invalid GitHub repository URL')
+            owner, repo = parts[0], parts[1].removesuffix('.git')
+            branch = 'main'
+            if len(parts) >= 4 and parts[2] == 'tree':
+                branch = '/'.join(parts[3:])
+
+            def log(msg):
                 try:
                     with open(log_file, 'a', encoding='utf-8') as f:
                         f.write(f"[{datetime.now().strftime('%I:%M:%S %p')}] {msg}\n")
-                        f.flush()
-                except:
+                except Exception:
                     pass
-            
-            deploy_log("Preparing deployment...")
-            
-            # Parse GitHub URL → owner/repo/branch
-            # Support: https://github.com/user/repo or https://github.com/user/repo.git
-            # Also: https://github.com/user/repo/tree/branch
-            
-            clean_url = repo_url.replace('.git', '').rstrip('/')
-            
-            # Extract owner and repo
-            if 'github.com' not in clean_url:
-                deploy_log("❌ Error: Only GitHub URLs are supported!")
+
+            log(f"Repository: {owner}/{repo}")
+            log(f"Branch: {branch}")
+            headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'APURBO-DEV-HOSTING'}
+            if access_token:
+                headers['Authorization'] = f'Bearer {access_token}'
+            url = f'https://api.github.com/repos/{owner}/{repo}/zipball/{branch}'
+            response = requests.get(url, headers=headers, stream=True, timeout=60)
+            if response.status_code != 200:
+                log(f"❌ GitHub returned HTTP {response.status_code}")
+                if response.status_code in (401, 404):
+                    log('Check the repository URL and access token/private-repository permissions.')
                 return
-            
-            parts = clean_url.split('github.com/')[-1].split('/')
-            
-            if len(parts) < 2:
-                deploy_log("❌ Error: Invalid GitHub URL format!")
-                return
-            
-            owner = parts[0]
-            repo = parts[1]
-            branch = 'main'  # default branch
-            
-            # Check if branch is specified (tree/branch_name)
-            if len(parts) > 3 and parts[2] == 'tree':
-                branch = parts[3]
-            
-            deploy_log(f"Owner: {owner}")
-            deploy_log(f"Repository: {repo}")
-            deploy_log(f"Branch: {branch}")
-            deploy_log(f"Downloading ZIP archive...")
-            
-            # Build API URL
-            api_url = f"https://api.github.com/repos/{owner}/{repo}/zipball/{branch}"
-            
-            headers = {'Accept': 'application/vnd.github.v3+json'}
-            if is_private and access_token:
-                headers['Authorization'] = f'token {access_token}'
-                deploy_log("Using access token for authentication")
-            
-            # Download ZIP
-            response = requests.get(api_url, headers=headers, stream=True, timeout=60)
-            
-            if response.status_code == 200:
-                deploy_log("✓ Repository downloaded successfully!")
-                deploy_log("Extracting files...")
-                
-                # Save to temp zip
-                temp_zip = os.path.join(server_dir, '_github_temp.zip')
+
+            temp_zip = os.path.join(server_dir, '_github_temp.zip')
+            try:
                 with open(temp_zip, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                
-                # Extract
-                try:
-                    with zipfile.ZipFile(temp_zip, 'r') as zf:
-                        # GitHub zipball has a root folder like: owner-repo-commit_hash
-                        # Extract everything inside that folder
-                        root_folder = zf.namelist()[0].split('/')[0]
-                        
-                        for member in zf.namelist():
-                            # Skip the root folder
-                            relative_path = '/'.join(member.split('/')[1:])
-                            if not relative_path:
-                                continue
-                            
-                            target_path = os.path.join(server_dir, relative_path)
-                            
-                            if member.endswith('/'):
-                                # Directory
-                                os.makedirs(target_path, exist_ok=True)
-                            else:
-                                # File
-                                os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                                with zf.open(member) as source, open(target_path, 'wb') as target:
-                                    shutil.copyfileobj(source, target)
-                                deploy_log(f"  ✓ {relative_path}")
-                    
-                    deploy_log("")
-                    deploy_log("✅ Deployment completed successfully!")
-                    deploy_log(f"Files extracted to: {server_dir}")
-                    
-                except Exception as e:
-                    deploy_log(f"❌ Extraction error: {str(e)}")
-                finally:
-                    # Clean up temp zip
-                    try:
-                        os.remove(temp_zip)
-                    except:
-                        pass
-                    
-            elif response.status_code == 404:
-                deploy_log("❌ Error: Repository not found!")
-                deploy_log("Check if the URL is correct and the repo is accessible")
-            elif response.status_code == 401:
-                deploy_log("❌ Error: Authentication failed!")
-                deploy_log("Check your access token (for private repos)")
-            elif response.status_code == 403:
-                deploy_log("❌ Error: Rate limit exceeded or access denied!")
-                deploy_log("Try again later or use an access token")
-            else:
-                deploy_log(f"❌ Error: HTTP {response.status_code}")
-                deploy_log(f"Response: {response.text[:200]}")
-            
+                        if chunk:
+                            f.write(chunk)
+                log('✓ Repository downloaded. Extracting...')
+                with zipfile.ZipFile(temp_zip, 'r') as zf:
+                    base = os.path.realpath(server_dir)
+                    members = zf.infolist()
+                    root = members[0].filename.split('/')[0] if members else ''
+                    for member in members:
+                        parts2 = member.filename.split('/')
+                        relative = '/'.join(parts2[1:]) if root and parts2[0] == root else member.filename
+                        if not relative:
+                            continue
+                        target = os.path.realpath(os.path.join(base, relative))
+                        if os.path.commonpath([base, target]) != base:
+                            raise ValueError('Unsafe ZIP path detected')
+                        if member.is_dir():
+                            os.makedirs(target, exist_ok=True)
+                        else:
+                            os.makedirs(os.path.dirname(target), exist_ok=True)
+                            with zf.open(member) as src, open(target, 'wb') as dst:
+                                shutil.copyfileobj(src, dst)
+                log('✅ Deployment completed successfully!')
+            finally:
+                try: os.remove(temp_zip)
+                except OSError: pass
         except requests.exceptions.Timeout:
-            try:
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"[{datetime.now().strftime('%I:%M:%S %p')}] ❌ Error: Connection timeout! Check your internet.\n")
-            except:
-                pass
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"[{datetime.now().strftime('%I:%M:%S %p')}] ❌ Connection timeout.\n")
         except Exception as e:
-            try:
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"[{datetime.now().strftime('%I:%M:%S %p')}] ❌ Error: {str(e)}\n")
-            except:
-                pass
-    
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"[{datetime.now().strftime('%I:%M:%S %p')}] ❌ Error: {e}\n")
+
     threading.Thread(target=deploy_thread, daemon=True).start()
     return jsonify({'status': 'success', 'msg': 'Deployment started! Check terminal for progress.'})
 
 @app.route('/api/github/logs/<server_id>')
 def api_github_logs(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     """Get GitHub deployment logs"""
     log_file = os.path.join(get_server_dir(server_id), 'github_deploy.log')
     if os.path.exists(log_file):
@@ -983,6 +994,9 @@ def api_github_logs(server_id):
 
 @app.route('/api/github/clear_logs/<server_id>', methods=['POST'])
 def api_github_clear_logs(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     """Clear GitHub deployment logs"""
     log_file = os.path.join(get_server_dir(server_id), 'github_deploy.log')
     try:
@@ -998,12 +1012,16 @@ def api_github_clear_logs(server_id):
 
 @app.route('/api/files/<server_id>')
 def api_files(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     folder = request.args.get('folder', '')
     server_dir = get_server_dir(server_id)
     if folder:
-        server_dir = os.path.join(server_dir, folder)
-        if not os.path.abspath(server_dir).startswith(os.path.abspath(get_server_dir(server_id))):
-            return jsonify({'files': []})
+        try:
+            server_dir = safe_server_path(server_id, folder)
+        except ValueError:
+            return jsonify({'error': 'Invalid folder path'}), 400
     if not os.path.exists(server_dir): return jsonify({'files': []})
     
     files = []
@@ -1016,24 +1034,42 @@ def api_files(server_id):
 
 @app.route('/api/file/<server_id>', methods=['GET'])
 def api_get_file(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     filename = request.args.get('filename', '')
-    filepath = os.path.join(get_server_dir(server_id), filename)
+    try:
+        filepath = safe_server_path(server_id, filename)
+    except ValueError:
+        return jsonify({'error': 'Invalid path'}), 400
     if os.path.exists(filepath) and os.path.isfile(filepath):
         with open(filepath, 'r', encoding='utf-8') as f: return jsonify({'content': f.read()})
     return jsonify({'error': 'Not found'}), 404
 
 @app.route('/api/file/<server_id>', methods=['POST'])
 def api_save_file(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     data = request.get_json()
-    filepath = os.path.join(get_server_dir(server_id), data.get('filename', ''))
+    try:
+        filepath = safe_server_path(server_id, data.get('filename', ''))
+    except ValueError:
+        return jsonify({'error': 'Invalid path'}), 400
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, 'w', encoding='utf-8') as f: f.write(data.get('content', ''))
     return jsonify({'success': True})
 
 @app.route('/api/file/<server_id>', methods=['DELETE'])
 def api_delete_file(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     data = request.get_json()
-    filepath = os.path.join(get_server_dir(server_id), data.get('filename', ''))
+    try:
+        filepath = safe_server_path(server_id, data.get('filename', ''))
+    except ValueError:
+        return jsonify({'error': 'Invalid path'}), 400
     if os.path.exists(filepath):
         if os.path.isdir(filepath): shutil.rmtree(filepath)
         else: os.remove(filepath)
@@ -1041,28 +1077,48 @@ def api_delete_file(server_id):
 
 @app.route('/api/upload/<server_id>', methods=['POST'])
 def api_upload(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     if 'file' not in request.files: return jsonify({'error': 'No file'}), 400
     folder = request.form.get('folder', '')
-    server_dir = get_server_dir(server_id)
-    if folder:
-        server_dir = os.path.join(server_dir, folder)
-        os.makedirs(server_dir, exist_ok=True)
+    try:
+        server_dir = safe_server_path(server_id, folder)
+    except ValueError:
+        return jsonify({'error': 'Invalid folder path'}), 400
+    os.makedirs(server_dir, exist_ok=True)
     file = request.files['file']
-    file.save(os.path.join(server_dir, file.filename))
-    return jsonify({'success': True})
+    filename = secure_filename(file.filename or '')
+    if not filename:
+        return jsonify({'error': 'Invalid filename'}), 400
+    file.save(os.path.join(server_dir, filename))
+    return jsonify({'success': True, 'filename': filename})
 
 @app.route('/api/create_folder/<server_id>', methods=['POST'])
 def api_create_folder(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     data = request.get_json()
-    os.makedirs(os.path.join(get_server_dir(server_id), data.get('foldername', '')), exist_ok=True)
+    try:
+        folder_path = safe_server_path(server_id, data.get('foldername', ''))
+    except ValueError:
+        return jsonify({'error': 'Invalid folder path'}), 400
+    os.makedirs(folder_path, exist_ok=True)
     return jsonify({'success': True})
 
 @app.route('/api/rename/<server_id>', methods=['POST'])
 def api_rename(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     d = request.get_json()
     server_dir = get_server_dir(server_id)
-    old_path = os.path.join(server_dir, d.get('old_name', ''))
-    new_path = os.path.join(server_dir, d.get('new_name', ''))
+    try:
+        old_path = safe_server_path(server_id, d.get('old_name', ''))
+        new_path = safe_server_path(server_id, d.get('new_name', ''))
+    except ValueError:
+        return jsonify({'error': 'Invalid path'}), 400
     if os.path.exists(old_path):
         os.rename(old_path, new_path)
         return jsonify({'success': True})
@@ -1070,23 +1126,41 @@ def api_rename(server_id):
 
 @app.route('/api/unzip/<server_id>', methods=['POST'])
 def api_unzip(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     data = request.get_json()
-    zip_path = os.path.join(get_server_dir(server_id), data.get('filename', ''))
+    try:
+        zip_path = safe_server_path(server_id, data.get('filename', ''))
+    except ValueError:
+        return jsonify({'status': 'error', 'msg': 'Invalid path'}), 400
     if os.path.exists(zip_path) and zip_path.endswith('.zip'):
         try:
-            with zipfile.ZipFile(zip_path, 'r') as zf: zf.extractall(os.path.dirname(zip_path))
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                base = os.path.realpath(os.path.dirname(zip_path))
+                for member in zf.infolist():
+                    target = os.path.realpath(os.path.join(base, member.filename))
+                    if os.path.commonpath([base, target]) != base:
+                        return jsonify({'status': 'error', 'msg': 'Unsafe ZIP path detected'}), 400
+                zf.extractall(base)
             return jsonify({'status': 'success', 'msg': 'Extracted!'})
         except Exception as e: return jsonify({'status': 'error', 'msg': str(e)})
     return jsonify({'status': 'error', 'msg': 'Invalid zip'}), 400
 
 @app.route('/api/get_startup/<server_id>')
 def api_get_startup(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     server, _ = get_server_by_id(server_id)
     if server: return jsonify({'main_file': server.get('main_file', 'main.py'), 'requirements_file': server.get('requirements_file', 'requirements.txt')})
     return jsonify({'main_file': 'main.py', 'requirements_file': 'requirements.txt'})
 
 @app.route('/api/set_startup/<server_id>', methods=['POST'])
 def api_set_startup(server_id):
+    server_access, auth_error, auth_code = require_server_access(server_id)
+    if auth_error:
+        return auth_error, auth_code
     d = request.get_json()
     users = load_users()
     for uname, udata in users.items():
@@ -1095,8 +1169,18 @@ def api_set_startup(server_id):
         if not isinstance(servers, list): continue
         for s in servers:
             if isinstance(s, dict) and s.get('server_id') == server_id:
-                s['main_file'] = d.get('main_file', 'main.py')
-                s['requirements_file'] = d.get('requirements_file')
+                main_file = str(d.get('main_file', 'main.py')).strip()
+                requirements_file = str(d.get('requirements_file') or '').strip()
+                if not main_file:
+                    return jsonify({'error': 'Main file is required'}), 400
+                try:
+                    safe_server_path(server_id, main_file)
+                    if requirements_file:
+                        safe_server_path(server_id, requirements_file)
+                except ValueError:
+                    return jsonify({'error': 'Invalid startup file path'}), 400
+                s['main_file'] = main_file
+                s['requirements_file'] = requirements_file or None
                 save_users(users)
                 return jsonify({'success': True})
     return jsonify({'error': 'Not found'}), 404

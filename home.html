@@ -268,6 +268,11 @@
                             class="w-full bg-[#0c0e14] border border-gray-700 rounded-lg px-4 py-2.5 text-sm text-white focus:border-amber-500 outline-none">
                     </div>
                     <div class="mb-3">
+                        <label class="block text-gray-400 text-xs mb-1.5">Current Password</label>
+                        <input type="password" id="currentPassword" placeholder="Enter current password"
+                            class="w-full bg-[#0c0e14] border border-gray-700 rounded-lg px-4 py-2.5 text-sm text-white focus:border-amber-500 outline-none">
+                    </div>
+                    <div class="mb-3">
                         <label class="block text-gray-400 text-xs mb-1.5">New Password</label>
                         <input type="password" id="newPassword" placeholder="Enter new password" 
                             class="w-full bg-[#0c0e14] border border-gray-700 rounded-lg px-4 py-2.5 text-sm text-white focus:border-amber-500 outline-none">
@@ -559,10 +564,11 @@
             if (currentFolder) fd.append('folder', currentFolder);
             
             showToast('Uploading...', 'info', 0);
-            fetch(`/api/upload/${currentServerId}`, {method:'POST', body:fd}).then(() => {
+            fetch(`/api/upload/${currentServerId}`, {method:'POST', body:fd}).then(r=>r.json()).then(data => {
+                if (!data.success) throw new Error(data.error || 'Upload failed');
                 loadFileList(currentFolder); document.getElementById('fileInput').value='';
                 showToast('Uploaded!', 'success', 2000);
-            });
+            }).catch(e => showToast(e.message || 'Upload failed!', 'error', 3000));
         }
 
         function createFolder() { 
@@ -699,10 +705,11 @@
 
         // ============ PROFILE ============
         function updateCredentials() {
+            const currentPass = document.getElementById('currentPassword').value;
             const newPass = document.getElementById('newPassword').value;
             const confirm = document.getElementById('confirmPassword').value;
             
-            if (!newPass || !confirm) {
+            if (!currentPass || !newPass || !confirm) {
                 showToast('Please fill all password fields!', 'error');
                 return;
             }
@@ -721,7 +728,7 @@
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
-                    current_password: '',
+                    current_password: currentPass,
                     new_password: newPass
                 })
             })
@@ -729,6 +736,7 @@
             .then(d => {
                 if (d.success || d.msg) {
                     showToast('Password updated successfully!', 'success');
+                    document.getElementById('currentPassword').value = '';
                     document.getElementById('newPassword').value = '';
                     document.getElementById('confirmPassword').value = '';
                 } else {
